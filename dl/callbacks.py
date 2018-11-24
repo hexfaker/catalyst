@@ -6,6 +6,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+from tensorboardX import SummaryWriter
 
 from catalyst.data.functional import compute_mixup_lambda, mixup_torch
 from catalyst.dl.callback import Callback
@@ -138,36 +139,6 @@ class Logger(Callback):
             "{}: {:.5f}".format(k, v) for k, v in metrics.items())
 
 
-class TensorboardLogger(Callback):
-    """
-    Logger callback, translates state.*_metrics to tensorboard
-    """
-
-    def __init__(self, logdir: str = None):
-        """
-        :param logdir: log directory to use for tf logging
-        """
-        self.logdir = logdir
-        self.loggers = dict()
-
-    def on_loader_start(self, state):
-        lm = state.loader_mode
-        if lm not in self.loggers:
-            self.loggers[lm] = UtilsFactory.create_tflogger(
-                logdir=self.logdir, name=lm)
-
-    def on_batch_end(self, state):
-        lm = state.loader_mode
-        for key, value in state.batch_metrics.items():
-            self.loggers[lm].add_scalar(key, value, state.step)
-
-    def on_loader_end(self, state):
-        lm = state.loader_mode
-
-        for key, value in state.epoch_metrics[lm].items():
-            self.loggers[lm].add_scalar(f"epoch {key}", value, state.epoch)
-
-
 class GroupTensorboardLogger(Callback):
     """
     Another tensorboard logger. Uses tags to group same metrics, but for
@@ -180,7 +151,8 @@ class GroupTensorboardLogger(Callback):
         logdir: str = None,
         metric_names: List[str] = None,
         log_on_batch_end=True,
-        log_on_epoch_end=True
+        log_on_epoch_end=True,
+        split_by_loader=False
     ):
         """
         :param logdir: directory where logs will be created
@@ -188,23 +160,45 @@ class GroupTensorboardLogger(Callback):
             If none - logs everything.
         :param log_on_batch_end: Logs per-batch value of metrics,
             prepends 'batch_' prefix to their names.
-        :param log_on_epoch_end: Logs per-epoch metrics if set True.
+        :param log_on_epoch_end: Logs per-epoch metrics if set True
+
+        :param split_by_loader: Uses separate writer in separate subdir per loader
+            (will be visible as two different runs in TB)
         """
 
         self.logdir = logdir
         self.metrics_to_log = metric_names
+        self.split_by_loader = split_by_loader
         self.log_on_batch_end = log_on_batch_end
         self.log_on_epoch_end = log_on_epoch_end
 
         # You definitely should log something)
         assert self.log_on_batch_end or self.log_on_epoch_end
 
-        self.writer = None
+        self.writers = {}
 
-    def on_loader_start(self, state):
-        if self.writer is None:
-            self.writer = UtilsFactory.create_tflogger(
-                logdir=self.logdir, name="group")
+    @property
+    def _writer_suffix(self):
+        suffix = '_'
+
+        if self.log_on_batch_end:
+            suffix += 'b'
+
+        if self.log_on_epoch_end:
+            suffix += 'e'
+        return suffix
+
+    def _get_writer(self, mode):
+        if not self.split_by_loader:
+            mode = ''
+
+        if mode not in self.writers:
+            self.writers[mode] = SummaryWriter(
+                os.path.join(self.logdir, mode),
+                filename_suffix=self._writer_suffix  # Prevents conflict between instances
+            )
+
+        return self.writers[mode]
 
     def _log_metrics(
         self,
@@ -218,13 +212,16 @@ class GroupTensorboardLogger(Callback):
 
         for name in self.metrics_to_log:
             if name in metrics:
-                self.writer.add_scalar(f"{prefix}{name}/{mode}",
-                                       metrics[name], step)
+                self._get_writer(mode) \
+                    .add_scalar(f"{prefix}{name}/{mode}", metrics[name], step)
 
     def on_loader_end(self, state: RunnerState):
         if self.log_on_epoch_end:
             mode = state.loader_mode
             self._log_metrics(state.epoch_metrics[mode], mode, state.epoch)
+
+        for wrt in self.writers.values():
+            wrt.flush()
 
     def on_batch_end(self, state: RunnerState):
         if self.log_on_batch_end:
